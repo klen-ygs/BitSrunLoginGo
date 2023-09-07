@@ -3,9 +3,14 @@ package srun
 import (
 	"encoding/json"
 	"errors"
+	"github.com/Mmx233/BitSrunLoginGo/internal/config"
+	"github.com/Mmx233/BitSrunLoginGo/tools"
 	log "github.com/sirupsen/logrus"
 	"net/http"
+	"time"
 )
+
+const acid = "5"
 
 type Conf struct {
 	//调用 API 时直接访问 https URL
@@ -15,18 +20,16 @@ type Conf struct {
 	Client    *http.Client
 }
 
-func New(conf *Conf) *Srun {
-	srun := &Srun{
-		LoginInfo: conf.LoginInfo,
-	}
-	srun.api.Init(conf.Https, conf.LoginInfo.Form.Domain, conf.Client)
+func New() *Srun {
+	srun := &Srun{}
+	srun.api.Init(false, "210.43.112.9", &http.Client{
+		Timeout: time.Second * 5,
+	})
 	return srun
 }
 
 type Srun struct {
-	//登录参数，不可缺省
-	LoginInfo LoginInfo
-	api       Api
+	api Api
 }
 
 func (c Srun) LoginStatus() (online bool, ip string, err error) {
@@ -56,17 +59,13 @@ func (c Srun) LoginStatus() (online bool, ip string, err error) {
 func (c Srun) DoLogin(clientIP string) error {
 	log.Debugln("正在获取 Token")
 
-	if c.LoginInfo.Form.UserType != "" {
-		c.LoginInfo.Form.Username += "@" + c.LoginInfo.Form.UserType
-	}
-
-	res, err := c.api.GetChallenge(c.LoginInfo.Form.Username, clientIP)
+	res, err := c.api.GetChallenge(config.UserInfo.Username, clientIP)
 	if err != nil {
-		return err
+		return errors.New("访问校园网服务器失败")
 	}
 	token, ok := res["challenge"]
 	if !ok {
-		return ErrResultCannotFound
+		return errors.New("您输入的用户信息无效")
 	}
 	tokenStr := token.(string)
 	log.Debugln("token: ", tokenStr)
@@ -74,11 +73,11 @@ func (c Srun) DoLogin(clientIP string) error {
 	log.Debugln("发送登录请求")
 
 	info, err := json.Marshal(map[string]string{
-		"username": c.LoginInfo.Form.Username,
-		"password": c.LoginInfo.Form.Password,
+		"username": config.UserInfo.Username,
+		"password": config.UserInfo.Password,
 		"ip":       clientIP,
-		"acid":     c.LoginInfo.Meta.Acid,
-		"enc_ver":  c.LoginInfo.Meta.Enc,
+		"acid":     acid,
+		"enc_ver":  "srun_bx1",
 	})
 	if err != nil {
 		return err
@@ -87,37 +86,72 @@ func (c Srun) DoLogin(clientIP string) error {
 	Md5Str := Md5(tokenStr)
 	EncryptedMd5 := "{MD5}" + Md5Str
 	EncryptedChkstr := Sha1(
-		tokenStr + c.LoginInfo.Form.Username + tokenStr + Md5Str +
-			tokenStr + c.LoginInfo.Meta.Acid + tokenStr + clientIP +
-			tokenStr + c.LoginInfo.Meta.N + tokenStr + c.LoginInfo.Meta.Type +
+		tokenStr + config.UserInfo.Username + tokenStr + Md5Str +
+			tokenStr + acid + tokenStr + clientIP +
+			tokenStr + "200" + tokenStr + "1" +
 			tokenStr + EncryptedInfo,
 	)
 
-	res, err = c.api.Login(
-		c.LoginInfo.Form.Username,
-		EncryptedMd5,
-		c.LoginInfo.Meta.Acid,
-		clientIP,
-		EncryptedInfo,
-		EncryptedChkstr,
-		c.LoginInfo.Meta.N,
-		c.LoginInfo.Meta.Type,
+	for i := 0; i < 10; i++ {
+		if i != 0 {
+			time.Sleep(time.Second * 10)
+		}
+
+		login, err := c.loginAndTest(
+			EncryptedMd5,
+			clientIP,
+			EncryptedInfo,
+			EncryptedChkstr,
+		)
+		if err != nil {
+			tools.Notify("登录失败，稍后重试")
+			continue
+		}
+		if !login {
+			tools.Notify("登录失败，稍后重试")
+			continue
+		}
+		tools.Notify("usc 登录成功")
+		return nil
+	}
+
+	tools.Notify("usc无法登录")
+	return nil
+}
+
+func (c Srun) loginAndTest(md5 string, ip string, info string, Chkstr string) (bool, error) {
+	online, _, err := c.LoginStatus()
+	if online {
+		return true, nil
+	}
+
+	res, err := c.api.Login(
+		config.UserInfo.Username,
+		md5,
+		acid,
+		ip,
+		info,
+		Chkstr,
+		"200",
+		"1",
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var result interface{}
-	result, ok = res["error"]
+	result, ok := res["error"]
 	if !ok {
-		return ErrResultCannotFound
+		return false, ErrResultCannotFound
 	}
 	LoginResult := result.(string)
 
 	if LoginResult != "ok" {
-		return errors.New(LoginResult)
+		return false, errors.New(LoginResult)
 	}
 
-	return nil
+	time.Sleep(time.Second * 1)
+	online, _, err = c.LoginStatus()
+	return online, err
 }
 
 func (c Srun) DetectAcid() (string, error) {
